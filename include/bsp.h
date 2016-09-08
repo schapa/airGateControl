@@ -36,10 +36,10 @@ void BSP_start(void);
 uint8_t BSP_startCAN(void);
 ifaceControl_p BSP_CANControl(void);
 
-//void BSP_queuePush(Event_p pEvent);
-//void BSP_pendEvent(Event_p pEvent);
 
 void BSP_SetLedState(FunctionalState);
+void BSP_SetGateState(_Bool isOpen);
+void BSP_GatePeriodic(void);
 
 
 

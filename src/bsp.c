@@ -7,7 +7,6 @@
 
 #include "stm32f0xx_rcc.h"
 #include "stm32f0xx_gpio.h"
-#include "stm32f0xx_tim.h"
 #include "stm32f0xx_can.h"
 #include "stm32f0xx_exti.h"
 #include "stm32f0xx_syscfg.h"
@@ -19,7 +18,12 @@
 #include "bsp.h"
 #include "systemStatus.h"
 
-#define DEVICE_CAN_ID 0x135
+#define CAN_DEVICE_ID 0x135
+#define CAN_DEVICE_TIMEOUT (6*1000) // minute
+
+#define DEBOUNCE_PUSH_BUTTON 10
+#define DEBOUNCE_STATE_CHANGE 10*1000
+#define DEBOUNCE_USER_STATE_CHANGE (60*1000) // minute
 
 static void initialize_RCC(void);
 static void initialize_GPIO_CAN(void);
@@ -29,7 +33,6 @@ static void initialize_GPIO_CONTROL(void);
 static uint8_t configure_CAN(void);
 static void configure_CAN_NVIC(void);
 static void configure_GPIO_NVIC(void);
-static void configure_TIM1(void);
 
 static void setSTBState(FunctionalState);
 static void setENState(FunctionalState);
@@ -38,13 +41,21 @@ static bool getERRState(void);
 
 static bool sendData(uint32_t id, uint8_t *data, uint8_t size);
 
+static void releaseButton(void);
+static void pushButton(void);
+
 static ifaceControl_t s_canInterface = {
 		{setSTBState, setENState, getERRState},
 		.sendData = sendData,
 };
 static bool s_isInitialized = false;
 
-//static volatile EventQueue_p s_eventQueue;
+static struct {
+	_Bool volatile requestedState;
+	_Bool volatile realState;
+	size_t volatile debounce;
+} s_gateControl;
+static size_t volatile s_canMsgTimeout = CAN_DEVICE_TIMEOUT;
 
 void BSP_init(void) {
 
@@ -56,7 +67,6 @@ void BSP_init(void) {
 	initialize_GPIO_CONTROL();
 	configure_CAN_NVIC();
 	configure_GPIO_NVIC();
-	configure_TIM1();
 	s_isInitialized = true;
 }
 
@@ -86,28 +96,49 @@ void BSP_SetLedState(FunctionalState state) {
 	GPIO_WriteBit(GPIOA, GPIO_Pin_0, val);
 }
 
-void BSP_SetButtonState(FunctionalState state) {
-	BitAction val = (state == DISABLE) ? Bit_RESET : Bit_SET;
-	GPIO_WriteBit(GPIOA, GPIO_Pin_1, val);
+void BSP_SetGateState(_Bool isOpen) {
+	if (s_gateControl.requestedState != isOpen) {
+		if ((s_gateControl.realState == isOpen) && !s_gateControl.debounce) {
+			/* State change to real state, Just exit */
+			s_gateControl.debounce = 0;
+			s_gateControl.requestedState = s_gateControl.realState;
+			releaseButton();
+			return;
+		}
+		s_gateControl.requestedState = isOpen;
+		if (s_gateControl.debounce) {
+			/* already waiting. Exit */
+			return;
+		}
+		pushButton();
+	}
 }
-//void BSP_queuePush(Event_p pEvent) {
-//	uint32_t primask = __get_PRIMASK();
-//	__disable_irq();
-//	s_eventQueue = Queue_pushEvent(s_eventQueue, pEvent);
-//	if (!primask) {
-//		__enable_irq();
-//	}
-//}
-//
-//void BSP_pendEvent(Event_p pEvent) {
-//	while (!s_eventQueue);
-//	uint32_t primask = __get_PRIMASK();
-//	__disable_irq();
-//	s_eventQueue = Queue_getEvent(s_eventQueue, pEvent);
-//	if (!primask) {
-//		__enable_irq();
-//	}
-//}
+
+void BSP_GatePeriodic(void) {
+	if (s_gateControl.debounce) {
+		s_gateControl.debounce--;
+	} else {
+		releaseButton();
+	}
+	if (s_canMsgTimeout) {
+		s_canMsgTimeout--;
+	} else {
+		BSP_CANControl()->hardwareLine.setSTB(ENABLE);
+		System_delayMsDummy(20);
+	}
+}
+
+static void releaseButton(void) {
+	if (GPIO_ReadOutputDataBit(GPIOA, GPIO_Pin_1) != Bit_RESET) {
+		s_gateControl.debounce = DEBOUNCE_STATE_CHANGE;
+		GPIO_WriteBit(GPIOA, GPIO_Pin_1, Bit_RESET);
+	}
+}
+
+static void pushButton(void) {
+	s_gateControl.debounce = DEBOUNCE_PUSH_BUTTON;
+	GPIO_WriteBit(GPIOA, GPIO_Pin_1, Bit_SET);
+}
 
 /* private */
 static void initialize_RCC(void) {
@@ -117,7 +148,6 @@ static void initialize_RCC(void) {
 	RCC_AHBPeriphClockCmd(RCC_AHBPeriph_GPIOB, ENABLE);
 
 	RCC_APB1PeriphClockCmd(RCC_APB1Periph_CAN, ENABLE);
-	RCC_APB2PeriphClockCmd(RCC_APB2Periph_TIM1, ENABLE);
 
 	GPIO_DeInit(GPIOA);
 }
@@ -291,21 +321,6 @@ static void configure_GPIO_NVIC(void) {
 	EXTI_Init(&exti);
 }
 
-static void configure_TIM1(void) {
-//	TIM_TimeBaseInitTypeDef iface;
-//	iface.TIM_ClockDivision = TIM_CKD_DIV4;
-//	iface.TIM_CounterMode = TIM_CounterMode_Up;
-//	iface.TIM_Period = 0xFF;
-//	iface.TIM_Prescaler = 470;
-//	iface.TIM_RepetitionCounter = 0;
-//
-//	TIM_TimeBaseInit(TIM1, &iface);
-//	TIM_SetAutoreload(TIM1, iface.TIM_Period);
-//	TIM_SelectOutputTrigger(TIM1, TIM_TRGOSource_Update);
-//
-//	TIM_Cmd(TIM1, ENABLE);
-}
-
 static bool sendData(uint32_t id, uint8_t *data, uint8_t size) {
 	CanTxMsg txMess = {
 			id,
@@ -327,7 +342,58 @@ static bool sendData(uint32_t id, uint8_t *data, uint8_t size) {
 
 void EXTI2_3_IRQHandler(void) {
 	if (EXTI_GetFlagStatus(EXTI_Line2)) {
-		BSP_SetButtonState(!GPIO_ReadOutputDataBit(GPIOA, GPIO_Pin_1));
+		const _Bool ledState = !GPIO_ReadInputDataBit(GPIOA,GPIO_Pin_2);
+		/* wait at least 1 sec */
+		if (System_getUptime() > 1) {
+			if (s_gateControl.realState == s_gateControl.requestedState) {
+				/* state changed by user */
+				s_gateControl.realState = s_gateControl.requestedState = ledState;
+				s_gateControl.debounce = DEBOUNCE_USER_STATE_CHANGE;
+			} else {
+				s_gateControl.realState = s_gateControl.requestedState;
+				s_gateControl.debounce = DEBOUNCE_STATE_CHANGE;
+			}
+		}
 		EXTI_ClearFlag(EXTI_Line2);
+	}
+}
+
+void CEC_CAN_IRQHandler(void) {
+
+	if (CAN_GetITStatus(CAN, CAN_IT_FMP0)) {
+		CanRxMsg rx = {0};
+		CAN_Receive(CAN, CAN_FIFO0, &rx);
+//		s_canMsgTimeout = CAN_DEVICE_TIMEOUT;
+	}
+	if (CAN_GetITStatus(CAN, CAN_IT_FMP1)) {
+		trace_printf("CAN_IT_FMP1 \n");
+	}
+	if (CAN_GetITStatus(CAN, CAN_IT_TME)) {
+		trace_printf("CAN_IT_TME \n");
+		trace_printf("\t MAIL 0 %d\n", CAN_TransmitStatus(CAN, 0));
+		trace_printf("\t MAIL 1 %d\n", CAN_TransmitStatus(CAN, 1));
+		trace_printf("\t MAIL 2 %d\n", CAN_TransmitStatus(CAN, 2));
+		CAN_ClearITPendingBit(CAN, CAN_IT_TME);
+	}
+
+	if (CAN_GetITStatus(CAN, CAN_IT_EWG)) {
+		trace_printf("EWG \n");
+		CAN_ClearITPendingBit(CAN, CAN_IT_EWG);
+	}
+	if (CAN_GetITStatus(CAN, CAN_IT_EPV)) {
+		trace_printf("EPV \n");
+		CAN_ClearITPendingBit(CAN, CAN_IT_EPV);
+	}
+	if (CAN_GetITStatus(CAN, CAN_IT_BOF)) {
+		trace_printf("BOF \n");
+		CAN_ClearITPendingBit(CAN, CAN_IT_BOF);
+	}
+	if (CAN_GetITStatus(CAN, CAN_IT_LEC)) {
+		trace_printf("LEC \n");
+		CAN_ClearITPendingBit(CAN, CAN_IT_LEC);
+	}
+	if (CAN_GetITStatus(CAN, CAN_IT_ERR)) {
+		trace_printf("ERR \n");
+		CAN_ClearITPendingBit(CAN, CAN_IT_ERR);
 	}
 }
