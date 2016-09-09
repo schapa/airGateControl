@@ -17,13 +17,7 @@
 
 #include "bsp.h"
 #include "systemStatus.h"
-
-#define CAN_DEVICE_ID 0x135
-#define CAN_DEVICE_TIMEOUT (6*1000) // minute
-
-#define DEBOUNCE_PUSH_BUTTON 10
-#define DEBOUNCE_STATE_CHANGE 10*1000
-#define DEBOUNCE_USER_STATE_CHANGE (60*1000) // minute
+#include "diag/Trace.h"
 
 static void initialize_RCC(void);
 static void initialize_GPIO_CAN(void);
@@ -41,21 +35,11 @@ static bool getERRState(void);
 
 static bool sendData(uint32_t id, uint8_t *data, uint8_t size);
 
-static void releaseButton(void);
-static void pushButton(void);
-
 static ifaceControl_t s_canInterface = {
 		{setSTBState, setENState, getERRState},
 		.sendData = sendData,
 };
 static bool s_isInitialized = false;
-
-static struct {
-	_Bool volatile requestedState;
-	_Bool volatile realState;
-	size_t volatile debounce;
-} s_gateControl;
-static size_t volatile s_canMsgTimeout = CAN_DEVICE_TIMEOUT;
 
 void BSP_init(void) {
 
@@ -96,48 +80,13 @@ void BSP_SetLedState(FunctionalState state) {
 	GPIO_WriteBit(GPIOA, GPIO_Pin_0, val);
 }
 
-void BSP_SetGateState(_Bool isOpen) {
-	if (s_gateControl.requestedState != isOpen) {
-		if ((s_gateControl.realState == isOpen) && !s_gateControl.debounce) {
-			/* State change to real state, Just exit */
-			s_gateControl.debounce = 0;
-			s_gateControl.requestedState = s_gateControl.realState;
-			releaseButton();
-			return;
-		}
-		s_gateControl.requestedState = isOpen;
-		if (s_gateControl.debounce) {
-			/* already waiting. Exit */
-			return;
-		}
-		pushButton();
-	}
+void BSP_SetButtonState(const _Bool state) {
+	BitAction val = state ? Bit_SET : Bit_RESET;
+	GPIO_WriteBit(GPIOA, GPIO_Pin_1, val);
 }
 
-void BSP_GatePeriodic(void) {
-	if (s_gateControl.debounce) {
-		s_gateControl.debounce--;
-	} else {
-		releaseButton();
-	}
-	if (s_canMsgTimeout) {
-		s_canMsgTimeout--;
-	} else {
-		BSP_CANControl()->hardwareLine.setSTB(ENABLE);
-		System_delayMsDummy(20);
-	}
-}
-
-static void releaseButton(void) {
-	if (GPIO_ReadOutputDataBit(GPIOA, GPIO_Pin_1) != Bit_RESET) {
-		s_gateControl.debounce = DEBOUNCE_STATE_CHANGE;
-		GPIO_WriteBit(GPIOA, GPIO_Pin_1, Bit_RESET);
-	}
-}
-
-static void pushButton(void) {
-	s_gateControl.debounce = DEBOUNCE_PUSH_BUTTON;
-	GPIO_WriteBit(GPIOA, GPIO_Pin_1, Bit_SET);
+_Bool BSP_GetLedState(void) {
+	return !GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_2);
 }
 
 /* private */
@@ -261,7 +210,7 @@ static uint8_t configure_CAN(void) {
 	iface.CAN_NART = ENABLE;
 	iface.CAN_RFLM = DISABLE;
 	iface.CAN_TXFP = DISABLE;
-	iface.CAN_Mode = CAN_Mode_Normal;
+	iface.CAN_Mode = CAN_Mode_Silent;//CAN_Mode_Normal;
 	iface.CAN_SJW = CAN_SJW_1tq;
 	iface.CAN_BS1 = CAN_BS1_4tq;
 	iface.CAN_BS2 = CAN_BS2_3tq;
@@ -342,17 +291,9 @@ static bool sendData(uint32_t id, uint8_t *data, uint8_t size) {
 
 void EXTI2_3_IRQHandler(void) {
 	if (EXTI_GetFlagStatus(EXTI_Line2)) {
-		const _Bool ledState = !GPIO_ReadInputDataBit(GPIOA,GPIO_Pin_2);
 		/* wait at least 1 sec */
 		if (System_getUptime() > 1) {
-			if (s_gateControl.realState == s_gateControl.requestedState) {
-				/* state changed by user */
-				s_gateControl.realState = s_gateControl.requestedState = ledState;
-				s_gateControl.debounce = DEBOUNCE_USER_STATE_CHANGE;
-			} else {
-				s_gateControl.realState = s_gateControl.requestedState;
-				s_gateControl.debounce = DEBOUNCE_STATE_CHANGE;
-			}
+			Gate_onLedStateChange(BSP_GetLedState());
 		}
 		EXTI_ClearFlag(EXTI_Line2);
 	}
@@ -363,7 +304,7 @@ void CEC_CAN_IRQHandler(void) {
 	if (CAN_GetITStatus(CAN, CAN_IT_FMP0)) {
 		CanRxMsg rx = {0};
 		CAN_Receive(CAN, CAN_FIFO0, &rx);
-//		s_canMsgTimeout = CAN_DEVICE_TIMEOUT;
+		Gate_onCanRx(&rx);
 	}
 	if (CAN_GetITStatus(CAN, CAN_IT_FMP1)) {
 		trace_printf("CAN_IT_FMP1 \n");
