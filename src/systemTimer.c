@@ -8,6 +8,7 @@
 #include "bsp.h"
 #include "systemStatus.h"
 #include <stddef.h>
+#include "timers.h"
 
 #define TICKS_PER_SECOND 1000
 
@@ -72,10 +73,13 @@ void SysTick_Handler(void) {
 	if (!(s_uptimeTicks++ % TICKS_PER_SECOND)) {
 		s_uptimeSeconds++;
 	}
-	Gate_Periodic();
+	Timer_makeTick();
 }
 
 void System_delayMsDummy(uint32_t delay) {
+	uint32_t irq = (SCB->ICSR & SCB_ICSR_VECTACTIVE_Msk) ;
+	if(irq == 16 + SysTick_IRQn) // Could not wait if Called form SysTick isr
+		return;
 	s_delayDecrement = delay;
 	while (s_delayDecrement);
 }
