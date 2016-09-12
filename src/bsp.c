@@ -17,7 +17,14 @@
 
 #include "bsp.h"
 #include "systemStatus.h"
+#include "timers.h"
 #include "diag/Trace.h"
+
+#define CAN_CONTROL_UNIT_ID 0x50
+#define CAN_SENSOR_ID 0x135
+
+#define DEBOUNCE_PUSH_BUTTON (100)
+#define BUS_TIMEOUT (1000) // 1 sec
 
 static void initialize_RCC(void);
 static void initialize_GPIO_CAN(void);
@@ -35,11 +42,17 @@ static bool getERRState(void);
 
 static bool sendData(uint32_t id, uint8_t *data, uint8_t size);
 
+static void onButtonTimeout(uint32_t id, void *data);
+static void onBusTimeout(uint32_t id, void *data);
+
 static ifaceControl_t s_canInterface = {
 		{setSTBState, setENState, getERRState},
 		.sendData = sendData,
 };
 static bool s_isInitialized = false;
+static uint32_t s_pushButtonTimId = INVALID_HANDLE;
+static uint32_t s_busWatchdogTimId = INVALID_HANDLE;
+
 
 void BSP_init(void) {
 
@@ -68,6 +81,7 @@ uint8_t BSP_startCAN(void) {
 	}
 	System_setStatus(INFORM_INIT);
 	result &= configure_CAN();
+	s_busWatchdogTimId = Timer_newArmed(BUS_TIMEOUT, true, onBusTimeout, NULL);
 	return result;
 }
 
@@ -80,13 +94,31 @@ void BSP_SetLedState(FunctionalState state) {
 	GPIO_WriteBit(GPIOA, GPIO_Pin_0, val);
 }
 
-void BSP_SetButtonState(const _Bool state) {
-	BitAction val = state ? Bit_SET : Bit_RESET;
-	GPIO_WriteBit(GPIOA, GPIO_Pin_1, val);
+void BSP_PushButton(void) {
+	if (s_pushButtonTimId == INVALID_HANDLE) {
+		GPIO_WriteBit(GPIOA, GPIO_Pin_1, Bit_SET);
+		s_pushButtonTimId = Timer_newArmed(DEBOUNCE_PUSH_BUTTON, false, onButtonTimeout, NULL);
+	}
 }
 
-_Bool BSP_GetLedState(void) {
+_Bool BSP_GateLedState(void) {
+	/* pulled low - light on*/
 	return !GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_2);
+}
+
+
+static void onButtonTimeout(uint32_t id, void *data) {
+	(void)id;
+	(void)data;
+	GPIO_WriteBit(GPIOA, GPIO_Pin_1, Bit_RESET);
+}
+
+static void onBusTimeout(uint32_t id, void *data) {
+	(void)id;
+	(void)data;
+	System_setStatus(INFORM_CONNECTION_LOST);
+	BSP_CANControl()->hardwareLine.setSTB(ENABLE);
+	System_delayMsDummy(20);
 }
 
 /* private */
@@ -293,7 +325,8 @@ void EXTI2_3_IRQHandler(void) {
 	if (EXTI_GetFlagStatus(EXTI_Line2)) {
 		/* wait at least 1 sec */
 		if (System_getUptime() > 1) {
-			Gate_onLedStateChange(BSP_GetLedState());
+			onButtonTimeout(0,0); // force button release
+			Gate_onLedStateChange(BSP_GateLedState());
 		}
 		EXTI_ClearFlag(EXTI_Line2);
 	}
@@ -304,7 +337,13 @@ void CEC_CAN_IRQHandler(void) {
 	if (CAN_GetITStatus(CAN, CAN_IT_FMP0)) {
 		CanRxMsg rx = {0};
 		CAN_Receive(CAN, CAN_FIFO0, &rx);
-		Gate_onCanRx(&rx);
+		switch (rx.StdId) {
+			case CAN_SENSOR_ID:
+				Gate_SetState(rx.Data[0] < 12);
+			case CAN_CONTROL_UNIT_ID:
+				Timer_rearm(s_busWatchdogTimId);
+				break;
+		}
 	}
 	if (CAN_GetITStatus(CAN, CAN_IT_FMP1)) {
 		trace_printf("CAN_IT_FMP1 \n");

@@ -15,7 +15,6 @@ extern "C" {
 #include "stm32f0xx.h"
 #include <stdbool.h>
 #include "stm32f0xx_can.h"
-//#include "Queue.h"
 
 typedef void (*control_f) (FunctionalState);
 typedef bool (*getState_f) (void);
@@ -37,15 +36,12 @@ void BSP_start(void);
 uint8_t BSP_startCAN(void);
 ifaceControl_p BSP_CANControl(void);
 
-
 void BSP_SetLedState(FunctionalState);
-void BSP_SetButtonState(const _Bool state);
-_Bool BSP_GetLedState(void);
+void BSP_PushButton(void);
 
-void Gate_Periodic(void);
+_Bool BSP_GateLedState(void);
 void Gate_onLedStateChange(const _Bool ledState);
-void Gate_onCanRx(const CanRxMsg *rx);
-
+void Gate_SetState(const _Bool newState);
 
 
 #ifdef __cplusplus

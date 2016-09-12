@@ -8,6 +8,7 @@
 #include "bsp.h"
 #include "systemStatus.h"
 #include <stddef.h>
+#include "timers.h"
 
 #define TICKS_PER_SECOND 1000
 
@@ -73,6 +74,7 @@ void SysTick_Handler(void) {
 		s_uptimeSeconds++;
 	}
 	Gate_Periodic();
+	Timer_makeTick();
 }
 
 void System_delayMsDummy(uint32_t delay) {

@@ -8,100 +8,71 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <assert.h>
 
 #include "bsp.h"
 #include "systemStatus.h"
+#include "timers.h"
 
-#define CAN_CONTROL_UNIT_ID 0x50
-#define CAN_SENSOR_ID 0x135
-#define CAN_DEVICE_TIMEOUT (1000) // 1 sec
-
-#define DEBOUNCE_PUSH_BUTTON 100
 #define DEBOUNCE_STATE_CHANGE 10*1000
-#define DEBOUNCE_USER_STATE_CHANGE (60*1000) // minute
+#define USER_BLOCK_TIMEOUT (60*1000) // minute
 
-static void setState(const _Bool isOpen);
-static void releaseButton(void);
-static void pushButton(void);
+static void setState(const _Bool isClose);
+static void onUserBlockTimeout(uint32_t id, void *data);
+static void onStateBlockTimeout(uint32_t id, void *data);
 
 static struct {
 	_Bool volatile requestedState;
 	_Bool volatile realState;
-	size_t volatile debounce;
+	uint32_t userBlockTimId;
+	uint32_t sateBlockTimId;
 } s_gateControl;
 
-static size_t volatile s_canMsgTimeout = CAN_DEVICE_TIMEOUT;
 
-
-void Gate_Periodic(void) {
-	if (s_gateControl.debounce) {
-		s_gateControl.debounce--;
-	} else if (s_gateControl.realState != s_gateControl.requestedState) {
-		_Bool spike = s_gateControl.requestedState;
-//		s_gateControl.requestedState = !s_gateControl.requestedState;
-//		setState(spike);
-	} else {
-		releaseButton();
-	}
-	if (s_canMsgTimeout) {
-		System_setStatus(s_gateControl.realState ? INFORM_SLEEP : INFORM_IDLE);
-		s_canMsgTimeout--;
-	} else {
-		System_setStatus(INFORM_CONNECTION_LOST);
-		BSP_CANControl()->hardwareLine.setSTB(ENABLE);
-//		System_delayMsDummy(20);
-	}
+void Gate_SetState(const _Bool newState) {
+	setState(newState);
 }
 
 void Gate_onLedStateChange(const _Bool ledState) {
-	if (s_gateControl.realState == s_gateControl.requestedState) {
+	s_gateControl.realState = ledState;
+	if (ledState != s_gateControl.requestedState) {
 		/* state changed by user */
-		s_gateControl.realState = s_gateControl.requestedState = ledState;
-		s_gateControl.debounce = DEBOUNCE_USER_STATE_CHANGE;
+		s_gateControl.requestedState = ledState;
+		if (s_gateControl.userBlockTimId) {
+			/* user toggled state. Unblock */
+			onUserBlockTimeout(s_gateControl.userBlockTimId, 0);
+		} else {
+			s_gateControl.userBlockTimId = Timer_newArmed(USER_BLOCK_TIMEOUT, false, onUserBlockTimeout, NULL);
+		}
 	} else {
-		s_gateControl.realState = s_gateControl.requestedState;
-		s_gateControl.debounce = DEBOUNCE_STATE_CHANGE;
+		/* success set */
+		s_gateControl.userBlockTimId = Timer_newArmed(DEBOUNCE_STATE_CHANGE, false, onStateBlockTimeout, NULL);
 	}
 }
 
-void Gate_onCanRx(const CanRxMsg *rx) {
-	switch (rx->StdId) {
-	case CAN_SENSOR_ID:
-		setState(rx->Data[0] < 12);
-	case CAN_CONTROL_UNIT_ID:
-		s_canMsgTimeout = CAN_DEVICE_TIMEOUT;
-		break;
-	}
-	s_canMsgTimeout = CAN_DEVICE_TIMEOUT;
-}
-
-static void setState(_Bool isOpen) {
-	if (s_gateControl.requestedState != isOpen) {
-		s_gateControl.realState = !BSP_GetLedState();
-		if ((s_gateControl.realState == isOpen) && !s_gateControl.debounce) {
-			/* State change to real state, Just exit */
-			s_gateControl.debounce = 0;
-			s_gateControl.requestedState = s_gateControl.realState;
-			releaseButton();
+static void setState(_Bool isClose) {
+	if (s_gateControl.realState ^ isClose) {
+		s_gateControl.requestedState = isClose;
+		if (s_gateControl.userBlockTimId) // active timer means user block
 			return;
-		}
-		s_gateControl.requestedState = isOpen;
-		if (s_gateControl.debounce) {
-			/* already waiting. Exit */
-			return;
-		}
-		pushButton();
+		BSP_PushButton();
 	}
 }
 
-static void releaseButton(void) {
-	if (GPIO_ReadOutputDataBit(GPIOA, GPIO_Pin_1) != Bit_RESET) {
-		GPIO_WriteBit(GPIOA, GPIO_Pin_1, Bit_RESET);
-		s_gateControl.debounce = DEBOUNCE_STATE_CHANGE;
+static void onUserBlockTimeout(uint32_t id, void *data) {
+	(void)data;
+	assert(s_gateControl.userBlockTimId == id);
+	s_gateControl.userBlockTimId = INVALID_HANDLE;
+	if (s_gateControl.realState ^ s_gateControl.requestedState) {
+		setState(s_gateControl.requestedState);
 	}
 }
 
-static void pushButton(void) {
-	s_gateControl.debounce = DEBOUNCE_PUSH_BUTTON;
-	GPIO_WriteBit(GPIOA, GPIO_Pin_1, Bit_SET);
+static void onStateBlockTimeout(uint32_t id, void *data) {
+	(void)data;
+	assert(s_gateControl.sateBlockTimId == id);
+	s_gateControl.sateBlockTimId = INVALID_HANDLE;
+	if (s_gateControl.realState ^ s_gateControl.requestedState) {
+		setState(s_gateControl.requestedState);
+	}
 }
